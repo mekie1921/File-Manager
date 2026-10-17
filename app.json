@@ -1,24 +1,40 @@
 {
   "expo": {
-    "name": "PocketFiles",
+    "name": "Best",
     "slug": "PocketFiles",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/M App Icon.png",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      }
+        "backgroundColor": "#073b2c",
+        "foregroundImage": "./assets/M App Icon.png",
+        "backgroundImage": "./assets/best-adaptive-background.png",
+        "monochromeImage": "./assets/best-adaptive-monochrome.png"
+      },
+      "package": "com.pocketfiles.app"
     },
     "web": {
-      "favicon": "./assets/favicon.png"
+      "favicon": "./assets/M App Icon.png"
+    },
+    "plugins": [
+      "expo-sharing",
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Allow Best to use Face ID to unlock the app."
+        }
+      ],
+      "expo-secure-store"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f07969b2-816b-4756-8a33-0940db833177"
+      }
     }
   }
 }
