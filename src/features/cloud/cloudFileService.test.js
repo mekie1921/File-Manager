@@ -22,6 +22,7 @@ function createHarness({
   storageDownloadError = null,
   downloadBytes = [1, 2, 3],
   localFileSize = 3,
+  downloadUri = null,
   restoreMissing = false,
   listError = null,
 } = {}) {
@@ -161,7 +162,7 @@ function createHarness({
     },
     writeLocalFile: async (filename, bytes) => {
       writes.push({ filename, bytes });
-      return `file:///documents/PocketFiles/${filename}`;
+      return downloadUri || `file:///documents/PocketFiles/${filename}`;
     },
     createId: () => 'object-2',
   });
@@ -228,6 +229,27 @@ test('refuses document-provider content URIs before any remote write', async () 
     /content URIs are not supported/
   );
   assert.equal(calls.some(([kind]) => kind === 'storage.upload'), false);
+});
+
+test('uploads browser-selected File contents without requiring a native file URI', async () => {
+  const { service, calls } = createHarness();
+  const file = {
+    size: 3,
+    async arrayBuffer() {
+      return new Uint8Array([1, 2, 3]).buffer;
+    },
+  };
+
+  await service.upload({
+    file,
+    name: 'notes.txt',
+    mimeType: 'text/plain',
+    size: 3,
+  });
+
+  const upload = calls.find(([kind]) => kind === 'storage.upload');
+  assert.deepEqual([...upload[2]], [1, 2, 3]);
+  assert.equal(calls.some(([kind]) => kind === 'readLocalFile'), false);
 });
 
 test('cleans up the uploaded object when metadata insertion fails', async () => {
@@ -362,7 +384,6 @@ test('downloads only owner-scoped records to the local file writer', async () =>
     filename: 'notes.txt',
     storage_path: `${ownerId}/object-1`,
   });
-
   assert.equal(result.size, 3);
   assert.deepEqual([...writes[0].bytes], [1, 2, 3]);
   assert.ok(calls.some((call) => call[0] === 'storage.download' && call[1] === `${ownerId}/object-1`));
@@ -370,6 +391,19 @@ test('downloads only owner-scoped records to the local file writer', async () =>
     service.download({ id: 'foreign', owner_id: 'someone-else', filename: 'x', storage_path: 'someone-else/x' }),
     /does not belong to the current account/
   );
+});
+
+test('accepts a browser blob URL for a verified cloud download', async () => {
+  const { service } = createHarness({ downloadUri: 'blob:https://best.example/download-id' });
+  const result = await service.download({
+    id: 'file-1',
+    owner_id: ownerId,
+    filename: 'notes.txt',
+    storage_path: `${ownerId}/object-1`,
+  });
+
+  assert.equal(result.localUri, 'blob:https://best.example/download-id');
+  assert.equal(result.size, 3);
 });
 
 test('rejects stale cloud paths before downloading their object', async () => {

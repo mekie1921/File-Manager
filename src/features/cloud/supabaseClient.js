@@ -1,12 +1,15 @@
 
 import 'react-native-url-polyfill/auto.js';
 import { createClient } from '@supabase/supabase-js';
-import * as SecureStore from 'expo-secure-store';
+import { getSecureStoreModule, isReactNativeWeb } from '../platform/nativeModules.js';
 import { createSecureSessionStorage } from './secureSessionStorage.js';
 import {
   initializeConfiguredSupabase,
   resolveSupabaseConfiguration,
 } from './supabaseConfiguration.js';
+
+const secureStorePlatform = isReactNativeWeb() ? 'web' : 'native';
+const SecureStore = getSecureStoreModule(secureStorePlatform);
 
 const configuration = resolveSupabaseConfiguration({
   url: process.env.EXPO_PUBLIC_SUPABASE_URL,

@@ -2,6 +2,7 @@
   "expo": {
     "name": "Best",
     "slug": "PocketFiles",
+    "scheme": "pocketfiles",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/M App Icon.png",
@@ -19,9 +20,35 @@
       "package": "com.pocketfiles.app"
     },
     "web": {
-      "favicon": "./assets/M App Icon.png"
+      "favicon": "./assets/M App Icon.png",
+      "output": "static"
     },
     "plugins": [
+      [
+        "expo-router",
+        {
+          "root": "src/app"
+        }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "Allow Best to discover photos, videos, and audio files you choose to browse.",
+          "granularPermissions": [
+            "photo",
+            "video",
+            "audio"
+          ]
+        }
+      ],
+      [
+        "expo-share-intent",
+        {
+          "disableIOS": true,
+          "androidIntentFilters": ["*/*"],
+          "androidMultiIntentFilters": ["*/*"]
+        }
+      ],
       "expo-sharing",
       [
         "expo-local-authentication",

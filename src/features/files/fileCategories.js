@@ -58,6 +58,7 @@ export function fileCategoryKey(item) {
 }
 
 export function matchesFileCategory(item, categoryKey) {
+  if (categoryKey === 'downloads' && /download/i.test(item?.path || '')) return true;
   return fileCategoryKey(item) === categoryKey;
 }
 

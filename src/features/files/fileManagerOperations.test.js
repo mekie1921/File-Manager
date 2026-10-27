@@ -82,6 +82,19 @@ test('folder creation, import, and rename update the next directory listing', as
   assert.deepEqual((await fs.readDirectoryAsync(root)).sort(), ['Reports', 'renamed.txt']);
 });
 
+test('import copies Android-granted content URIs without modifying the source', async () => {
+  const fs = createFileSystem();
+  const source = 'content://provider/shared/document/42';
+  const destination = 'file:///documents/PocketFiles/shared.pdf';
+  fs.files.set(source, 'shared contents');
+
+  const savedUri = await importLocalFile(fs, source, 'file:///documents/PocketFiles/', 'shared.pdf');
+
+  assert.equal(savedUri, destination);
+  assert.equal(fs.files.get(savedUri), 'shared contents');
+  assert.equal(fs.files.get(source), 'shared contents');
+});
+
 test('nested folder navigation and breadcrumbs stay within the absolute app-storage URI', () => {
   const root = 'file:///documents/PocketFiles/';
   const nested = `${root}Reports/2026/`;

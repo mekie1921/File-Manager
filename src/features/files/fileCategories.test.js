@@ -38,6 +38,9 @@ test('provides exactly the requested default collection categories without Trave
     'other',
   ]);
   assert.equal(matchesFileCategory({ name: 'note.txt' }, 'documents'), true);
+  const downloadedPdf = { name: 'report.pdf', path: 'content://provider/tree/primary%3ADownload' };
+  assert.equal(fileCategoryKey(downloadedPdf), 'documents');
+  assert.equal(matchesFileCategory(downloadedPdf, 'downloads'), true);
   assert.equal(collectionCategoryForFile({ name: 'note.txt' }), 'documents');
   assert.equal(collectionCategoryForFile({ name: 'pack.zip' }), null);
 });

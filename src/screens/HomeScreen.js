@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Alert,
   AppState,
@@ -20,43 +20,43 @@ import * as FileSystem from 'expo-file-system/legacy';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Sharing from 'expo-sharing';
 import * as Crypto from 'expo-crypto';
-import * as LocalAuthentication from 'expo-local-authentication';
-import * as SecureStore from 'expo-secure-store';
+import { useShareIntent } from 'expo-share-intent';
 import {
   loadTrashEntries,
   moveItemsToTrash,
   moveToTrash,
   permanentlyDelete,
   restoreFromTrash,
-} from './localFileOperations';
+} from '../features/files/localFileOperations';
 import {
   copyFileIntoAuthorizedFolder,
   createAuthorizedFolder,
   deleteAuthorizedItem,
   listAuthorizedDirectory,
   parentBreadcrumbs,
-} from './authorizedFolderOperations';
+} from '../features/files/authorizedFolderOperations';
 import {
   supabase,
   supabaseConfigurationError,
-} from './cloud/supabaseClient.js';
-import { ensureAnonymousSession } from './cloud/anonymousSession.js';
+} from '../features/cloud/supabaseClient.js';
+import { ensureAnonymousSession } from '../features/cloud/anonymousSession.js';
 import {
   createCloudFileService,
   MAX_CLOUD_FILE_SIZE_BYTES,
-} from './cloud/cloudFileService.js';
-import { shareFilesOneAtATime } from './sharingOperations.js';
-import { openAndroidFile } from './androidFileOpening';
+} from '../features/cloud/cloudFileService.js';
+import { shareFilesOneAtATime } from '../features/files/sharingOperations.js';
+import { openAndroidFile } from '../features/files/androidFileOpening';
 import {
   createAppSecurity,
   isValidCredential,
-} from './appSecurity';
+} from '../features/security/appSecurity';
 import {
   CATEGORY_CONFIG,
   collectionCategoryForFile,
   fileCategoryKey,
   fileIconForItem,
-} from './fileCategories.js';
+  matchesFileCategory,
+} from '../features/files/fileCategories.js';
 import {
   DEFAULT_COLLECTIONS,
   emptyCollectionMetadata,
@@ -64,7 +64,7 @@ import {
   removeCollectionAssignments,
   renameCollectionPath,
   setCollectionMembership,
-} from './fileCollections.js';
+} from '../features/files/fileCollections.js';
 import {
   appDirectoryBreadcrumbs,
   createLocalFolder,
@@ -75,7 +75,31 @@ import {
   renameLocalItem,
   sortEntries,
   visibleSelectedItems,
-} from './fileManagerOperations.js';
+} from '../features/files/fileManagerOperations.js';
+import {
+  copyEligibleFiles,
+  DEFAULT_DISCOVERY_SETTINGS,
+  findAvailableFileName,
+  listAccessibleMedia,
+  listAuthorizedFilesRecursively,
+  mergeDiscoveredFiles,
+  normalizeDiscoverySettings,
+} from '../features/files/fileDiscovery.js';
+import {
+  loadRecentActivity,
+  recordRecentActivity,
+  removeRecentActivity,
+  saveRecentActivity,
+} from '../features/files/recentActivity.js';
+import {
+  getLocalAuthenticationModule,
+  getMediaLibraryModule,
+  getSecureStoreModule,
+} from '../features/platform/nativeModules';
+
+const SecureStore = getSecureStoreModule(Platform.OS);
+const MediaLibrary = getMediaLibraryModule(Platform.OS);
+const LocalAuthentication = getLocalAuthenticationModule(Platform.OS);
 
 const DOCUMENT_ROOT = FileSystem.documentDirectory || FileSystem.cacheDirectory || 'file://app-storage/';
 const APP_STORAGE = `${DOCUMENT_ROOT}PocketFiles/`;
@@ -83,9 +107,32 @@ const TRASH_ROOT = `${DOCUMENT_ROOT}PocketFilesTrash/`;
 const TRASH_INDEX = `${TRASH_ROOT}index.json`;
 const COLLECTION_METADATA = `${APP_STORAGE}.pocketfiles-collections.json`;
 const AUTHORIZED_FOLDER_RECORD = `${DOCUMENT_ROOT}pocketfiles-authorized-folder.json`;
+const DISCOVERY_SETTINGS_FILE = `${APP_STORAGE}.file-discovery-settings.json`;
+const AUTOMATIC_COPY_HISTORY_FILE = `${APP_STORAGE}.automatic-copy-history.json`;
+const RECENT_ACTIVITY_FILE = `${DOCUMENT_ROOT}pocketfiles-recent-activity.json`;
+const AUTOMATIC_COPY_ROOT = `${APP_STORAGE}Automatic copies/`;
+const INTERNAL_METADATA_FILES = new Set([
+  COLLECTION_METADATA,
+  DISCOVERY_SETTINGS_FILE,
+  AUTOMATIC_COPY_HISTORY_FILE,
+]);
+const expoFileCopyAdapter = {
+  async getInfoAsync(uri) {
+    return new ExpoFile(uri).info();
+  },
+  async copyAsync({ from, to }) {
+    await new ExpoFile(from).copy(new ExpoFile(to));
+  },
+  async moveAsync({ from, to }) {
+    await new ExpoFile(from).move(new ExpoFile(to));
+  },
+  async deleteAsync(uri) {
+    new ExpoFile(uri).delete();
+  },
+};
 let shareCacheFileSequence = 0;
 const PREVIEWABLE_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png']);
-const APP_ICON = require('./assets/M App Icon.png');
+const APP_ICON = require('../../assets/M App Icon.png');
 const SECURITY_CREDENTIAL_OPTIONS = [
   { type: 'password', label: 'Password', details: 'Use a private password with at least 8 characters.' },
   { type: 'pattern', label: 'Pattern', details: 'Connect at least 4 different dots.' },
@@ -255,6 +302,12 @@ export default function App() {
     }),
     []
   );
+  const {
+    hasShareIntent,
+    shareIntent,
+    resetShareIntent,
+    error: shareIntentError,
+  } = useShareIntent({ resetOnBackground: false });
   const [darkMode, setDarkMode] = useState(false);
   const [activeTab, setActiveTab] = useState('home');
   const [activeStorage, setActiveStorage] = useState('app');
@@ -264,6 +317,26 @@ export default function App() {
   const [authorizedFolderError, setAuthorizedFolderError] = useState('');
   const [entries, setEntries] = useState([]);
   const [allLocalFiles, setAllLocalFiles] = useState([]);
+  const [discoveredMediaFiles, setDiscoveredMediaFiles] = useState([]);
+  const [authorizedDiscoveredFiles, setAuthorizedDiscoveredFiles] = useState([]);
+  const [discoverySettings, setDiscoverySettings] = useState(DEFAULT_DISCOVERY_SETTINGS);
+  const [discoverySettingsReady, setDiscoverySettingsReady] = useState(false);
+  const [discoverySettingsError, setDiscoverySettingsError] = useState('');
+  const [automaticCopyHistory, setAutomaticCopyHistory] = useState({});
+  const [mediaPermission, setMediaPermission] = useState(null);
+  const [mediaDiscoveryError, setMediaDiscoveryError] = useState('');
+  const [authorizedDiscoveryError, setAuthorizedDiscoveryError] = useState('');
+  const [automaticCopyNotice, setAutomaticCopyNotice] = useState('');
+  const [recentActivity, setRecentActivity] = useState([]);
+  const [recentActivityLoading, setRecentActivityLoading] = useState(true);
+  const [recentActivityError, setRecentActivityError] = useState('');
+  const recentActivityRef = useRef([]);
+  const [isDiscoveringFiles, setIsDiscoveringFiles] = useState(false);
+  const discoverySettingsRef = useRef(discoverySettings);
+  const automaticCopyHistoryRef = useRef(automaticCopyHistory);
+  const discoveryInFlightRef = useRef(false);
+  const incomingShareSignatureRef = useRef(null);
+  const incomingShareErrorRef = useRef(null);
   const [collectionMetadata, setCollectionMetadata] = useState(emptyCollectionMetadata);
   const [collectionMetadataError, setCollectionMetadataError] = useState('');
   const [collectionMetadataNotice, setCollectionMetadataNotice] = useState('');
@@ -308,6 +381,10 @@ export default function App() {
   const [lockoutUntil, setLockoutUntil] = useState(0);
   const [currentTime, setCurrentTime] = useState(0);
 
+  discoverySettingsRef.current = discoverySettings;
+  automaticCopyHistoryRef.current = automaticCopyHistory;
+  recentActivityRef.current = recentActivity;
+
   useEffect(() => {
     let mounted = true;
     void (async () => {
@@ -335,7 +412,7 @@ export default function App() {
   }, [appSecurity, securityRetryKey]);
 
   useEffect(() => {
-    if (Platform.OS === 'web') return undefined;
+    if (Platform.OS === 'web' || !LocalAuthentication) return undefined;
     let mounted = true;
     const refreshAvailability = async () => {
       try {
@@ -439,6 +516,9 @@ export default function App() {
   }
 
   async function authenticateBiometric(promptMessage) {
+    if (Platform.OS === 'web' || !LocalAuthentication) {
+      throw new Error('Biometric authentication is unavailable on this platform.');
+    }
     const result = await LocalAuthentication.authenticateAsync({
       promptMessage,
       promptDescription: 'Confirm your identity to continue.',
@@ -726,7 +806,7 @@ export default function App() {
 
   const currentEntries = useMemo(() => {
     const filtered = entries.filter((item) => {
-      const matchesCategory = !categoryFilter || fileCategoryKey(item) === categoryFilter;
+      const matchesCategory = !categoryFilter || matchesFileCategory(item, categoryFilter);
       const assignedToSelectedCollection =
         !selectedCollection ||
         collectionMetadata.assignments[item.uri]?.[categoryFilter]?.includes(selectedCollection);
@@ -739,32 +819,64 @@ export default function App() {
     return sortEntries(filtered, sortMode);
   }, [categoryFilter, collectionMetadata, entries, search, selectedCollection, sortMode]);
 
-  const recentFiles = useMemo(() => {
-    return [...allLocalFiles]
-      .sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0))
-      .slice(0, 6);
-  }, [allLocalFiles]);
-  const visibleRecentFiles = useMemo(
+  const accessibleFiles = useMemo(
     () =>
-      allLocalFiles
-        .filter((file) => matchesSearch(file.name, search))
-        .sort((a, b) => (b.modifiedAt || 0) - (a.modifiedAt || 0))
-        .slice(0, search.trim() ? 100 : 6),
-    [allLocalFiles, search]
+      mergeDiscoveredFiles(
+        allLocalFiles,
+        discoveredMediaFiles,
+        authorizedDiscoveredFiles
+      ),
+    [allLocalFiles, authorizedDiscoveredFiles, discoveredMediaFiles]
   );
+  const recentFiles = useMemo(() => {
+    const accessibleByUri = new Map(accessibleFiles.map((file) => [file.uri, file]));
+    return recentActivity
+      .map((activity) => {
+        const file = accessibleByUri.get(activity.uri);
+        if (file) return { ...file, activityAt: activity.activityAt };
+        return activity.uri ? { ...activity, id: activity.uri, isDirectory: false, modifiedAt: activity.activityAt, accessible: false } : null;
+      })
+      .filter(Boolean)
+      .sort((left, right) => (right.activityAt || 0) - (left.activityAt || 0))
+      .slice(0, 6);
+  }, [accessibleFiles, recentActivity]);
+  const visibleRecentFiles = useMemo(() => {
+    const accessibleByUri = new Map(accessibleFiles.map((file) => [file.uri, file]));
+    return recentActivity
+      .map((activity) => {
+        const file = accessibleByUri.get(activity.uri);
+        return file
+          ? { ...file, activityAt: activity.activityAt, accessible: true }
+          : { ...activity, id: activity.uri, isDirectory: false, modifiedAt: activity.activityAt, accessible: false };
+      })
+      .filter((file) => matchesSearch(file.name, search))
+      .sort((left, right) => (right.activityAt || 0) - (left.activityAt || 0))
+      .slice(0, search.trim() ? 100 : 50);
+  }, [accessibleFiles, recentActivity, search]);
 
   const categorySummary = useMemo(() => {
     return CATEGORY_CONFIG.map((category) => ({
       ...category,
-      count: allLocalFiles.filter((file) => fileCategoryKey(file) === category.key).length,
+      count: accessibleFiles.filter((file) => matchesFileCategory(file, category.key)).length,
     }));
-  }, [allLocalFiles]);
+  }, [accessibleFiles]);
   const totalAppFileUsage = useMemo(
     () => allLocalFiles.reduce(
       (total, file) => total + (Number.isFinite(file.size) ? file.size : 0),
       0
     ),
     [allLocalFiles]
+  );
+  const automaticCopyFiles = useMemo(
+    () => allLocalFiles.filter((file) => file.uri.startsWith(AUTOMATIC_COPY_ROOT)),
+    [allLocalFiles]
+  );
+  const automaticCopyUsage = useMemo(
+    () => automaticCopyFiles.reduce(
+      (total, file) => total + (Number.isFinite(file.size) ? file.size : 0),
+      0
+    ),
+    [automaticCopyFiles]
   );
 
   const visibleCategories = useMemo(
@@ -798,12 +910,200 @@ export default function App() {
     ...new Set(selectedCurrentEntries.map(collectionCategoryForFile).filter(Boolean)),
   ];
 
-  async function ensureDirectory(path) {
+  const ensureDirectory = useCallback(async (path) => {
     const info = await FileSystem.getInfoAsync(path);
     if (!info.exists) {
       await FileSystem.makeDirectoryAsync(path, { intermediates: true });
     }
+  }, []);
+
+  const readDiscoveryJson = useCallback(async (uri, fallback) => {
+    const info = await FileSystem.getInfoAsync(uri);
+    if (!info.exists) return fallback;
+    try {
+      return JSON.parse(
+        await FileSystem.readAsStringAsync(uri, { encoding: 'utf8' })
+      );
+    } catch (error) {
+      throw new Error(`Could not read discovery settings: ${error?.message || 'invalid JSON'}`);
+    }
+  }, []);
+
+  const persistDiscoveryJson = useCallback(async (uri, value) => {
+    await ensureDirectory(APP_STORAGE);
+    await FileSystem.writeAsStringAsync(uri, JSON.stringify(value), { encoding: 'utf8' });
+  }, [ensureDirectory]);
+
+  const loadDiscoveryConfiguration = useCallback(async () => {
+    try {
+      const rawSettings = await readDiscoveryJson(
+        DISCOVERY_SETTINGS_FILE,
+        DEFAULT_DISCOVERY_SETTINGS
+      );
+      const rawHistory = await readDiscoveryJson(AUTOMATIC_COPY_HISTORY_FILE, {});
+      if (!rawHistory || typeof rawHistory !== 'object' || Array.isArray(rawHistory)) {
+        throw new Error('The automatic-copy history has an invalid format.');
+      }
+      const normalizedSettings = normalizeDiscoverySettings(rawSettings);
+      setDiscoverySettings(normalizedSettings);
+      discoverySettingsRef.current = normalizedSettings;
+      setAutomaticCopyHistory(rawHistory);
+      automaticCopyHistoryRef.current = rawHistory;
+      setDiscoverySettingsError('');
+    } catch (loadError) {
+      const message = loadError?.message || 'File discovery settings could not be loaded.';
+      setDiscoverySettingsError(message);
+      setDiscoverySettings({
+        ...DEFAULT_DISCOVERY_SETTINGS,
+        autoCopyEnabled: false,
+      });
+      discoverySettingsRef.current = {
+        ...DEFAULT_DISCOVERY_SETTINGS,
+        autoCopyEnabled: false,
+      };
+      setAutomaticCopyHistory({});
+      automaticCopyHistoryRef.current = {};
+    } finally {
+      setDiscoverySettingsReady(true);
+    }
+  }, [readDiscoveryJson]);
+
+  async function persistDiscoverySettings(nextSettings) {
+    const normalized = normalizeDiscoverySettings(nextSettings);
+    await persistDiscoveryJson(DISCOVERY_SETTINGS_FILE, normalized);
+    discoverySettingsRef.current = normalized;
+    setDiscoverySettings(normalized);
+    setDiscoverySettingsError('');
+    return normalized;
   }
+
+  const persistAutomaticCopyHistory = useCallback(async (nextHistory) => {
+    await persistDiscoveryJson(AUTOMATIC_COPY_HISTORY_FILE, nextHistory);
+    automaticCopyHistoryRef.current = nextHistory;
+    setAutomaticCopyHistory(nextHistory);
+  }, [persistDiscoveryJson]);
+
+  const refreshDiscoveredFiles = useCallback(async ({ manual = false } = {}) => {
+    const settings = discoverySettingsRef.current;
+    if (Platform.OS !== 'android' || !MediaLibrary || (!manual && !settings.autoDiscoveryEnabled)) return;
+    if (discoveryInFlightRef.current) return;
+    discoveryInFlightRef.current = true;
+    setIsDiscoveringFiles(true);
+    setMediaDiscoveryError('');
+    setAuthorizedDiscoveryError('');
+    try {
+      let mediaFiles = [];
+      let permission = null;
+      try {
+        permission = await MediaLibrary.getPermissionsAsync(false, ['photo', 'video', 'audio']);
+        setMediaPermission(permission);
+        if (permission.granted && permission.status === 'granted') {
+          mediaFiles = await listAccessibleMedia(MediaLibrary);
+          setMediaDiscoveryError('');
+        } else {
+          setMediaDiscoveryError(
+            'Media access is not granted. Allow access in Settings to discover shared photos, videos, and audio.'
+          );
+        }
+      } catch (mediaError) {
+        setMediaDiscoveryError(
+          mediaError?.message || 'Android media files could not be discovered.'
+        );
+      }
+      setDiscoveredMediaFiles(mediaFiles);
+
+      let authorizedFiles = [];
+      if (authorizedFolder?.uri) {
+        try {
+          authorizedFiles = listAuthorizedFilesRecursively(
+            authorizedFolder.uri,
+            ExpoDirectory
+          );
+          setAuthorizedDiscoveryError('');
+        } catch (folderError) {
+          setAuthorizedDiscoveryError(
+            `The selected folder could not be scanned. Choose it again if access was revoked. ${
+              folderError?.message || ''
+            }`
+          );
+        }
+      }
+      setAuthorizedDiscoveredFiles(authorizedFiles);
+
+      if (settings.autoCopyEnabled && settings.autoCopyTypes.length) {
+        await ensureDirectory(AUTOMATIC_COPY_ROOT);
+        const result = await copyEligibleFiles({
+          files: mergeDiscoveredFiles(mediaFiles, authorizedFiles),
+          settings,
+          history: automaticCopyHistoryRef.current,
+          destinationUri: AUTOMATIC_COPY_ROOT,
+          fileSystem: FileSystem,
+          copyFile: async (item, destination, size) => {
+            const source =
+              item.storageKind === 'shared-media'
+                ? await new MediaLibrary.Asset(item.uri).getUri()
+                : item.uri;
+            const sourceInfo = new ExpoFile(source).info();
+            if (!sourceInfo.exists || sourceInfo.isDirectory) {
+              throw new Error('The original file is no longer available.');
+            }
+            await importLocalFile(
+              expoFileCopyAdapter,
+              source,
+              AUTOMATIC_COPY_ROOT,
+              destination.slice(AUTOMATIC_COPY_ROOT.length),
+              size || sourceInfo.size || 0
+            );
+          },
+          saveHistory: persistAutomaticCopyHistory,
+        });
+        automaticCopyHistoryRef.current = result.history;
+        setAutomaticCopyHistory(result.history);
+        setAutomaticCopyNotice(
+          result.failures.length
+            ? `${result.copied.length} file(s) copied; ${result.failures.length} automatic copy operation(s) failed.`
+            : result.copied.length
+              ? `${result.copied.length} new file(s) copied to Best storage.`
+              : 'No new eligible files needed copying.'
+        );
+      }
+    } catch (refreshError) {
+      setMediaDiscoveryError(
+        refreshError?.message || 'Accessible files could not be refreshed.'
+      );
+    } finally {
+      discoveryInFlightRef.current = false;
+      setIsDiscoveringFiles(false);
+    }
+  }, [authorizedFolder, ensureDirectory, persistAutomaticCopyHistory]);
+
+  useEffect(() => {
+    void Promise.resolve().then(loadDiscoveryConfiguration);
+  }, [loadDiscoveryConfiguration]);
+
+  useEffect(() => {
+    if (!discoverySettingsReady || !discoverySettings.autoDiscoveryEnabled || !MediaLibrary) return undefined;
+    void Promise.resolve().then(() => refreshDiscoveredFiles());
+    if (!discoverySettings.autoRefreshEnabled || Platform.OS !== 'android') {
+      return undefined;
+    }
+    const mediaSubscription = MediaLibrary.addListener(() => {
+      void refreshDiscoveredFiles();
+    });
+    const appStateSubscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') void refreshDiscoveredFiles();
+    });
+    return () => {
+      mediaSubscription.remove();
+      appStateSubscription.remove();
+    };
+  }, [
+    authorizedFolder,
+    discoverySettings.autoDiscoveryEnabled,
+    discoverySettings.autoRefreshEnabled,
+    discoverySettingsReady,
+    refreshDiscoveredFiles,
+  ]);
 
   async function loadStorageInfo() {
     try {
@@ -822,6 +1122,61 @@ export default function App() {
     }
   }
 
+  const loadRecentActivityIndex = useCallback(async () => {
+    setRecentActivityLoading(true);
+    try {
+      const records = await loadRecentActivity(FileSystem, RECENT_ACTIVITY_FILE);
+      setRecentActivity(records);
+      recentActivityRef.current = records;
+      setRecentActivityError('');
+    } catch (loadError) {
+      setRecentActivityError(
+        loadError?.message || 'Recent file activity could not be loaded.'
+      );
+    } finally {
+      setRecentActivityLoading(false);
+    }
+  }, []);
+
+  const recordRecentItem = useCallback(async (item) => {
+    if (!item || typeof item.uri !== 'string' || !item.uri) return;
+    const next = recordRecentActivity(recentActivityRef.current, item, Date.now());
+    recentActivityRef.current = next;
+    setRecentActivity(next);
+    try {
+      await saveRecentActivity(FileSystem, RECENT_ACTIVITY_FILE, next);
+      setRecentActivityError('');
+    } catch (saveError) {
+      setRecentActivityError(saveError?.message || 'Recent activity could not be saved.');
+    }
+  }, []);
+
+  async function removeRecentItem(uri) {
+    const next = removeRecentActivity(recentActivityRef.current, uri);
+    recentActivityRef.current = next;
+    setRecentActivity(next);
+    try {
+      await saveRecentActivity(FileSystem, RECENT_ACTIVITY_FILE, next);
+      setRecentActivityError('');
+    } catch (saveError) {
+      setRecentActivityError(saveError?.message || 'Recent activity could not be updated.');
+    }
+  }
+
+  useEffect(() => {
+    void Promise.resolve().then(loadRecentActivityIndex);
+    const subscription = AppState.addEventListener('change', (nextState) => {
+      if (nextState === 'active') void loadRecentActivityIndex();
+    });
+    return () => subscription.remove();
+  }, [loadRecentActivityIndex]);
+
+  useEffect(() => {
+    if (activeTab === 'home') {
+      void Promise.resolve().then(loadRecentActivityIndex);
+    }
+  }, [activeTab, loadRecentActivityIndex]);
+
   const readDirectory = useCallback(async (dirPath) => {
     setIsLoading(true);
     setError('');
@@ -833,16 +1188,26 @@ export default function App() {
       }
 
       const allFiles = (await listLocalFilesRecursively(FileSystem, APP_STORAGE))
-        .filter((item) => item.uri !== COLLECTION_METADATA)
+        .filter((item) => !INTERNAL_METADATA_FILES.has(item.uri))
         .map(metadataForItem);
       setAllLocalFiles(allFiles);
+      if (activeStorage === 'discovery') {
+        setEntries(
+          mergeDiscoveredFiles(
+            allFiles,
+            discoveredMediaFiles,
+            authorizedDiscoveredFiles
+          ).map(metadataForItem)
+        );
+        return;
+      }
       if (categoryFilter) {
         setEntries(allFiles);
         return;
       }
 
       const entriesList = (await FileSystem.readDirectoryAsync(dirPath)).filter(
-        (name) => `${dirPath}${name}` !== COLLECTION_METADATA
+        (name) => !INTERNAL_METADATA_FILES.has(`${dirPath}${name}`)
       );
       const items = await Promise.all(
         entriesList.map(async (name) => {
@@ -871,7 +1236,154 @@ export default function App() {
        } finally {
       setIsLoading(false);
     }
-  }, [activeStorage, categoryFilter]);
+  }, [
+    activeStorage,
+    authorizedDiscoveredFiles,
+    categoryFilter,
+    discoveredMediaFiles,
+  ]);
+
+  const saveIncomingShareFiles = useCallback(async (files) => {
+    const outcomes = [];
+    try {
+      await ensureDirectory(APP_STORAGE);
+    } catch (storageError) {
+      Alert.alert(
+        'Could not save shared files',
+        storageError?.message || 'Best storage is unavailable.'
+      );
+      return;
+    }
+
+    const reservedNames = new Set(allLocalFiles.map((file) => file.name));
+    for (const [index, file] of files.entries()) {
+      try {
+        const sourceUri = file?.path;
+        if (
+          typeof sourceUri !== 'string' ||
+          !(sourceUri.startsWith('content://') || sourceUri.startsWith('file://'))
+        ) {
+          throw new Error('Android did not provide a readable file reference.');
+        }
+        const name = requireImportedFileName(
+          typeof file.fileName === 'string' && file.fileName.trim()
+            ? file.fileName
+            : `Shared file ${index + 1}`
+        );
+        const destinationName = await findAvailableFileName(
+          name,
+          APP_STORAGE,
+          FileSystem,
+          reservedNames
+        );
+        reservedNames.add(destinationName);
+        const expectedSize = Number.isFinite(file.size) && file.size > 0 ? file.size : 0;
+        await importLocalFile(
+          FileSystem,
+          sourceUri,
+          APP_STORAGE,
+          destinationName,
+          expectedSize
+        );
+        const destination = `${APP_STORAGE}${destinationName}`;
+        await recordRecentItem({ uri: destination, name: destinationName, size: expectedSize });
+        outcomes.push({ name, error: null });
+      } catch (saveError) {
+        outcomes.push({
+          name: file?.fileName || `Shared file ${index + 1}`,
+          error: saveError?.message || 'The shared file could not be saved.',
+        });
+      }
+    }
+
+    let refreshError = '';
+    try {
+      const localFiles = (await listLocalFilesRecursively(FileSystem, APP_STORAGE))
+        .filter((item) => !INTERNAL_METADATA_FILES.has(item.uri))
+        .map(metadataForItem);
+      setAllLocalFiles(localFiles);
+      if (activeStorage !== 'authorized') {
+        await readDirectory(currentPath || APP_STORAGE);
+      }
+      await refreshDiscoveredFiles({ manual: true });
+    } catch (error) {
+      refreshError = error?.message || 'The saved-file list could not be refreshed.';
+    }
+
+    const copiedCount = outcomes.filter((outcome) => !outcome.error).length;
+    const failures = outcomes
+      .filter((outcome) => outcome.error)
+      .map((outcome) => `${outcome.name}: ${outcome.error}`);
+    Alert.alert(
+      copiedCount ? 'Shared file save results' : 'Shared files not saved',
+      `${copiedCount} of ${files.length} file(s) copied into Best storage.${
+        failures.length ? `\n\n${failures.join('\n')}` : ''
+      }${refreshError ? `\n\nFiles were saved, but the list could not be refreshed: ${refreshError}` : ''}`
+    );
+  }, [
+    activeStorage,
+    allLocalFiles,
+    currentPath,
+    ensureDirectory,
+    readDirectory,
+    recordRecentItem,
+    refreshDiscoveredFiles,
+  ]);
+
+  useEffect(() => {
+    if (shareIntentError && incomingShareErrorRef.current !== shareIntentError) {
+      incomingShareErrorRef.current = shareIntentError;
+      Alert.alert('Could not receive shared file', shareIntentError);
+    }
+    if (!hasShareIntent) {
+      incomingShareSignatureRef.current = null;
+      return;
+    }
+
+    const files = Array.isArray(shareIntent?.files) ? shareIntent.files : [];
+    if (!files.length) {
+      const signature = shareIntent?.text || shareIntent?.webUrl || 'unsupported-share';
+      if (incomingShareSignatureRef.current === signature) return;
+      incomingShareSignatureRef.current = signature;
+      Alert.alert(
+        'No file to save',
+        'Best can receive shared files, but this share did not include a file.',
+        [{ text: 'OK', onPress: resetShareIntent }]
+      );
+      return;
+    }
+
+    const signature = JSON.stringify(
+      files.map((file) => [file?.path, file?.fileName, file?.size])
+    );
+    if (incomingShareSignatureRef.current === signature) return;
+    incomingShareSignatureRef.current = signature;
+    Alert.alert(
+      'Save shared files to Best?',
+      `${files.length} file(s) were shared to Best. Saving creates a copy in Best storage and uses additional phone storage.`,
+      [
+        { text: 'Not now', style: 'cancel', onPress: resetShareIntent },
+        {
+          text: 'Save copies',
+          onPress: () => {
+            void saveIncomingShareFiles(files).finally(() => resetShareIntent());
+          },
+        },
+      ],
+      { cancelable: false }
+    );
+  }, [
+    activeStorage,
+    allLocalFiles,
+    currentPath,
+    hasShareIntent,
+    readDirectory,
+    refreshDiscoveredFiles,
+    resetShareIntent,
+    saveIncomingShareFiles,
+    shareIntent,
+    shareIntentError,
+  ]);
 
   async function readTrashIndex() {
     const result = await loadTrashEntries(FileSystem, TRASH_INDEX, TRASH_ROOT);
@@ -937,7 +1449,7 @@ export default function App() {
         setTrashError(message);
       }
     })();
-    }, [activeStorage, currentPath, readDirectory]);
+    }, [activeStorage, currentPath, ensureDirectory, readDirectory]);
 
   useEffect(() => {
     void (async () => {
@@ -975,13 +1487,19 @@ export default function App() {
         );
       }
     })();
-  }, []);
+  }, [ensureDirectory]);
   const navigateDirectory = useCallback((path) => {
     setCurrentPath(path);
     setSelectedIds([]);
   }, []);
 
   const goBack = useCallback(() => {
+    if (activeStorage === 'discovery') {
+      setCategoryFilter(null);
+      setSelectedCollection(null);
+      setActiveTab('categories');
+      return;
+    }
     if (activeStorage === 'authorized') {
       if (authorizedPathStack.length <= 1) return;
       const nextStack = authorizedPathStack.slice(0, -1);
@@ -1129,6 +1647,124 @@ export default function App() {
     }
   }
 
+  async function requestMediaAccess() {
+    if (Platform.OS !== 'android' || !MediaLibrary) {
+      setMediaDiscoveryError('Shared-media discovery is only available on the Android app build.');
+      return;
+    }
+    try {
+      const permission = await MediaLibrary.requestPermissionsAsync(
+        false,
+        ['photo', 'video', 'audio']
+      );
+      setMediaPermission(permission);
+      if (permission.granted && permission.status === 'granted') {
+        setMediaDiscoveryError('');
+        await refreshDiscoveredFiles({ manual: true });
+      } else {
+        setMediaDiscoveryError(
+          'Media access was not granted. Best can still browse files in folders you authorize.'
+        );
+      }
+    } catch (permissionError) {
+      const message = permissionError?.message || 'Android media access could not be requested.';
+      setMediaDiscoveryError(message);
+      Alert.alert('Media access unavailable', message);
+    }
+  }
+
+  async function manageLimitedMediaAccess() {
+    if (Platform.OS !== 'android' || !MediaLibrary) {
+      setMediaDiscoveryError('Shared media access management is only available in the Android app build.');
+      return;
+    }
+    try {
+      await MediaLibrary.presentPermissionsPicker(['photo', 'video']);
+      await refreshDiscoveredFiles({ manual: true });
+    } catch (permissionError) {
+      Alert.alert(
+        'Media access could not be updated',
+        permissionError?.message || 'Android could not open the media access picker.'
+      );
+    }
+  }
+
+  async function updateDiscoverySettings(patch, refresh = true) {
+    try {
+      const next = await persistDiscoverySettings({
+        ...discoverySettingsRef.current,
+        ...patch,
+      });
+      if (refresh) await refreshDiscoveredFiles({ manual: true });
+      return next;
+    } catch (saveError) {
+      const message = saveError?.message || 'File discovery settings could not be saved.';
+      setDiscoverySettingsError(message);
+      Alert.alert('Settings not saved', message);
+      return null;
+    }
+  }
+
+  async function saveSelectedFilesToBest() {
+    const sources = selectedCurrentEntries.filter(
+      (item) =>
+        !item.isDirectory &&
+        (item.storageKind === 'shared-media' || item.storageKind === 'authorized-folder')
+    );
+    if (!sources.length) {
+      Alert.alert('No external files selected', 'Select a shared or authorized-folder file to save a copy in Best storage.');
+      return;
+    }
+    const outcomes = [];
+    try {
+      await ensureDirectory(APP_STORAGE);
+      for (const item of sources) {
+        try {
+          const name = await findAvailableFileName(
+            requireImportedFileName(item.name),
+            APP_STORAGE,
+            FileSystem,
+            new Set(allLocalFiles.map((file) => file.name))
+          );
+          const source =
+            item.storageKind === 'shared-media'
+              ? await new MediaLibrary.Asset(item.uri).getUri()
+              : item.uri;
+          const sourceInfo = new ExpoFile(source).info();
+          if (!sourceInfo.exists || sourceInfo.isDirectory) {
+            throw new Error('The original file is no longer available.');
+          }
+          await importLocalFile(
+            expoFileCopyAdapter,
+            source,
+            APP_STORAGE,
+            name,
+            item.size || sourceInfo.size || 0
+          );
+          outcomes.push({ item, error: null });
+        } catch (copyError) {
+          outcomes.push({
+            item,
+            error: copyError?.message || 'The file could not be saved.',
+          });
+        }
+      }
+      await readDirectory(currentPath || APP_STORAGE);
+      const copiedCount = outcomes.filter((outcome) => !outcome.error).length;
+      const errors = outcomes
+        .filter((outcome) => outcome.error)
+        .map(({ item, error: copyError }) => `${item.name}: ${copyError}`);
+      Alert.alert(
+        copiedCount ? 'Save results' : 'Save failed',
+        `${copiedCount} of ${sources.length} file(s) copied into Best storage.${
+          errors.length ? `\n\n${errors.join('\n')}` : ''
+        }`
+      );
+    } catch (error) {
+      Alert.alert('Save failed', error?.message || 'The selected files could not be saved.');
+    }
+  }
+
   function toggleSelection(itemId) {
     setSelectedIds((current) =>
       current.includes(itemId) ? current.filter((id) => id !== itemId) : [...current, itemId]
@@ -1242,6 +1878,13 @@ export default function App() {
   }
 
   async function renameItem(item, nextName) {
+    if (activeStorage === 'discovery') {
+      Alert.alert(
+        'Rename unavailable',
+        'Files discovered in shared storage or an authorized folder stay in their original location. Use the system file provider to rename them.'
+      );
+      return;
+    }
     if (activeStorage === 'authorized') {
       Alert.alert(
         'Rename unavailable',
@@ -1293,9 +1936,10 @@ export default function App() {
     }
   }
 
-  function previewImage(item) {
+  async function previewImage(item) {
     setImagePreviewError('');
     setImagePreview(item);
+    await recordRecentItem(item);
   }
 
   async function toggleCollectionForSelection(collection) {
@@ -1328,6 +1972,13 @@ export default function App() {
   }
 
   async function handleDelete(item) {
+    if (activeStorage === 'discovery') {
+      Alert.alert(
+        'Delete unavailable',
+        'Discovery mode does not delete original phone files. Open the file in its original provider to manage it.'
+      );
+      return;
+    }
     const ifTrash = item.isTrashEntry;
     if (activeStorage === 'authorized' && !ifTrash) {
       Alert.alert(
@@ -1410,6 +2061,13 @@ export default function App() {
   async function handleBulkDelete() {
     const selectedEntries = selectedCurrentEntries;
     if (!selectedEntries.length) return;
+    if (activeStorage === 'discovery') {
+      Alert.alert(
+        'Delete unavailable',
+        'Files in discovery mode are shown in place and cannot be deleted from this view.'
+      );
+      return;
+    }
     if (activeStorage === 'authorized') {
       Alert.alert(
         'Permanently delete selected items?',
@@ -1505,6 +2163,7 @@ export default function App() {
       if (Platform.OS === 'android') {
         const file = new ExpoFile(item.uri);
         await openAndroidFile(file.contentUri, item.mimeType || file.type);
+        await recordRecentItem(item);
         return;
       }
       await shareFile(item, `Share ${item.name}`);
@@ -1543,7 +2202,7 @@ export default function App() {
     let shareError = null;
     try {
       let shareUri = item.uri;
-      if (activeStorage === 'authorized') {
+      if (activeStorage === 'authorized' || activeStorage === 'discovery') {
         cacheCopy = createShareCacheFile();
         await new ExpoFile(item.uri).copy(cacheCopy);
         shareUri = cacheCopy.uri;
@@ -1596,7 +2255,8 @@ export default function App() {
         Alert.alert('Imported', `${name} was copied to the selected authorized folder.`);
         return;
       }
-      await importLocalFile(FileSystem, asset.uri, currentPath, name);
+      const destination = await importLocalFile(FileSystem, asset.uri, currentPath, name);
+      await recordRecentItem({ uri: destination, name, size: asset.size || 0, mimeType: asset.mimeType || '' });
       await readDirectory(currentPath);
       Alert.alert('Imported', `${name} has been saved to ${currentPath}.`);
     } catch (error) {
@@ -1708,6 +2368,11 @@ export default function App() {
         if (activeStorage === 'app' && normalizePath(currentPath) === normalizePath(APP_STORAGE)) {
           await readDirectory(APP_STORAGE);
         }
+        await recordRecentItem({
+          uri: downloaded.localUri,
+          name: record.filename,
+          size: downloaded.size || 0,
+        });
         Alert.alert(
           'Downloaded',
           `${record.filename} was saved locally as ${downloaded.localUri.replace(APP_STORAGE, '')}.`
@@ -1785,7 +2450,7 @@ export default function App() {
         onPress={() => {
           if (selectedIds.length) {
             toggleSelection(item.id);
-          } else if (hasThumbnail && activeStorage === 'app') {
+          } else if (hasThumbnail) {
             previewImage(item);
           } else {
             handleOpenFile(item);
@@ -1793,7 +2458,7 @@ export default function App() {
         }}
         onLongPress={() => toggleSelection(item.id)}
       >
-        {hasThumbnail && activeStorage === 'app' ? (
+        {hasThumbnail ? (
           <Image
             source={{ uri: item.uri }}
             resizeMode="cover"
@@ -1811,7 +2476,7 @@ export default function App() {
             {item.isDirectory ? 'Folder' : `${formatBytes(item.size)} · ${item.type}`}
           </Text>
         </View>
-        <View style={styles.itemActions}>
+        {activeStorage !== 'discovery' ? <View style={styles.itemActions}>
           <TouchableOpacity
             accessibilityRole="button"
             accessibilityLabel={`Rename ${item.name}`}
@@ -1840,7 +2505,7 @@ export default function App() {
           >
             <Text style={[styles.actionGlyph, { color: theme.danger }]}>D</Text>
           </TouchableOpacity>
-        </View>
+        </View> : null}
       </TouchableOpacity>
     );
   };
@@ -1986,7 +2651,11 @@ export default function App() {
               </Text>
               <Text style={[styles.appSubtitle, { color: theme.muted }]}>
                 {activeTab === 'browse'
-                  ? (activeStorage === 'authorized' ? authorizedFolder?.name || 'Authorized folder' : 'On this device')
+                  ? (activeStorage === 'authorized'
+                    ? authorizedFolder?.name || 'Authorized folder'
+                    : activeStorage === 'discovery'
+                      ? 'Accessible phone files'
+                      : 'Best storage')
                   : activeTab === 'cloud'
                     ? cloudStatus
                     : activeTab === 'trash'
@@ -2103,7 +2772,7 @@ export default function App() {
                   onPress={() => {
                     setSelectedIds([]);
                     setSearch('');
-                    setActiveStorage('app');
+                    setActiveStorage('discovery');
                     setCurrentPath(APP_STORAGE);
                     setCategoryFilter(item.key);
                     setSelectedCollection(null);
@@ -2126,12 +2795,12 @@ export default function App() {
                 <Text style={{ fontSize: 21 }}>💾</Text>
               </View>
               <View style={styles.listInfo}>
-                <Text style={[styles.itemMeta, { color: theme.muted }]}>TOTAL FILE STORAGE</Text>
+                <Text style={[styles.itemMeta, { color: theme.muted }]}>BEST APP STORAGE</Text>
                 <Text style={[styles.fileUsageTotal, { color: theme.text }]}>
                   {formatBytes(totalAppFileUsage)}
                 </Text>
                 <Text style={[styles.itemMeta, { color: theme.muted }]}>
-                  Across {allLocalFiles.length} files in PocketFiles storage
+                  Across {allLocalFiles.length} files in Best&apos;s private storage
                 </Text>
               </View>
             </View>
@@ -2149,12 +2818,25 @@ export default function App() {
                     <Text style={[styles.recentMark, { color: theme.accent, backgroundColor: theme.accentSoft }]}>{fileIconForItem(file)}</Text>
                     <View style={styles.listInfo}>
                       <Text style={[styles.itemName, { color: theme.text }]}>{file.name}</Text>
-                      <Text style={[styles.itemMeta, { color: theme.muted }]}>{formatDate(file.modifiedAt)}</Text>
+                      <Text style={[styles.itemMeta, { color: file.accessible === false ? theme.danger : theme.muted }]}>
+                        {file.accessible === false
+                          ? 'Unavailable - original location is inaccessible'
+                          : formatDate(file.activityAt || file.modifiedAt)}
+                      </Text>
                     </View>
                   </TouchableOpacity>
                 ))
+              ) : recentActivityLoading ? (
+                <Text style={{ color: theme.muted }}>Loading recent files...</Text>
+              ) : recentActivityError ? (
+                <View>
+                  <Text style={{ color: theme.danger }}>{recentActivityError}</Text>
+                  <TouchableOpacity accessibilityRole="button" onPress={() => void loadRecentActivityIndex()} style={styles.outlineButton}>
+                    <Text style={{ color: theme.accent }}>Retry</Text>
+                  </TouchableOpacity>
+                </View>
               ) : (
-                <Text style={{ color: theme.muted }}>No recent files yet.</Text>
+                <Text style={{ color: theme.muted }}>No recent files yet. Files you open or import will appear here.</Text>
               )}
             </View>
 
@@ -2179,7 +2861,17 @@ export default function App() {
                 <TouchableOpacity style={[styles.quickButton, { backgroundColor: theme.cardAlt }]} onPress={selectAuthorizedFolder}>
                   <Text style={{ color: theme.text }}>Choose authorized folder</Text>
                 </TouchableOpacity>
+                {Platform.OS === 'android' && !mediaPermission?.granted ? (
+                  <TouchableOpacity style={[styles.quickButton, { backgroundColor: theme.accentSoft }]} onPress={() => void requestMediaAccess()}>
+                    <Text style={{ color: theme.accent }}>Allow shared media access</Text>
+                  </TouchableOpacity>
+                ) : null}
               </View>
+              {Platform.OS === 'android' && !mediaPermission?.granted ? (
+                <Text style={[styles.itemMeta, { color: theme.muted, marginTop: 8 }]}>
+                  Android will ask for access to photos, videos, and audio so Best can show them in place. No file copy is made for discovery.
+                </Text>
+              ) : null}
             </View>
           </ScrollView>
         )}
@@ -2198,7 +2890,9 @@ export default function App() {
               <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.breadcrumbBar}>
                 {(activeStorage === 'authorized'
                   ? authorizedPathStack
-                  : appDirectoryBreadcrumbs(currentPath, APP_STORAGE)
+                  : activeStorage === 'discovery'
+                    ? [{ name: 'Device files', uri: 'discovery://' }]
+                    : appDirectoryBreadcrumbs(currentPath, APP_STORAGE)
                 ).map((segment, index, arr) => (
                   <TouchableOpacity
                     key={`${segment.uri || segment.name}-${index}`}
@@ -2209,6 +2903,7 @@ export default function App() {
                         navigateDirectory(segment.uri);
                         return;
                       }
+                      if (activeStorage === 'discovery') return;
                       if (index === 0) {
                         openAppStorage();
                         return;
@@ -2225,7 +2920,9 @@ export default function App() {
             <Text style={[styles.itemMeta, { color: theme.muted, marginBottom: 8 }]}>
               {activeStorage === 'authorized'
                 ? `Authorized folder: ${authorizedFolder?.name || 'Selected folder'} · Provider operations may vary`
-                : 'Best private storage · managed by the app'}
+                : activeStorage === 'discovery'
+                  ? 'Discovery mode · original files stay in place; rename and delete are unavailable here'
+                  : 'Best private storage · managed by the app'}
             </Text>
             {categoryFilter ? (
               <View style={[styles.filterNotice, { backgroundColor: theme.accentSoft }]}>
@@ -2260,6 +2957,16 @@ export default function App() {
               >
                 <Text style={{ color: activeStorage === 'authorized' ? theme.accent : theme.text }}>Authorized folder</Text>
               </TouchableOpacity>
+              {activeStorage === 'discovery' ? (
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  disabled={isDiscoveringFiles}
+                  onPress={() => void refreshDiscoveredFiles({ manual: true })}
+                  style={[styles.quickButton, { backgroundColor: theme.accentSoft, opacity: isDiscoveringFiles ? 0.55 : 1 }]}
+                >
+                  <Text style={{ color: theme.accent }}>{isDiscoveringFiles ? 'Refreshing…' : 'Refresh discovered files'}</Text>
+                </TouchableOpacity>
+              ) : null}
               <TouchableOpacity
                 style={[styles.quickButton, { backgroundColor: theme.cardAlt }]}
                 onPress={selectAuthorizedFolder}
@@ -2292,15 +2999,23 @@ export default function App() {
                   <TouchableOpacity accessibilityRole="button" style={[styles.quickButton, { backgroundColor: theme.accentSoft }]} onPress={shareSelectedFiles}>
                     <Text style={{ color: theme.accent }}>Share</Text>
                   </TouchableOpacity>
-                  <TouchableOpacity accessibilityRole="button" style={[styles.quickButton, { backgroundColor: theme.dangerSoft }]} onPress={handleBulkDelete}>
-                    <Text style={{ color: theme.danger }}>{activeStorage === 'authorized' ? 'Delete permanently' : 'Delete'}</Text>
-                  </TouchableOpacity>
+                  {activeStorage === 'discovery' ? (
+                    <TouchableOpacity accessibilityRole="button" style={[styles.quickButton, { backgroundColor: theme.cardAlt }]} onPress={() => void saveSelectedFilesToBest()}>
+                      <Text style={{ color: theme.text }}>Save copy to Best</Text>
+                    </TouchableOpacity>
+                  ) : (
+                    <TouchableOpacity accessibilityRole="button" style={[styles.quickButton, { backgroundColor: theme.dangerSoft }]} onPress={handleBulkDelete}>
+                      <Text style={{ color: theme.danger }}>{activeStorage === 'authorized' ? 'Delete permanently' : 'Delete'}</Text>
+                    </TouchableOpacity>
+                  )}
                 </View>
               </View>
             )}
 
             <View style={styles.toolRow}>
-              <TouchableOpacity accessibilityRole="button" onPress={() => {
+              {activeStorage !== 'discovery' ? (
+                <>
+                  <TouchableOpacity accessibilityRole="button" onPress={() => {
                 if (categoryFilter) {
                   setCategoryFilter(null);
                   setSelectedCollection(null);
@@ -2314,6 +3029,17 @@ export default function App() {
               <TouchableOpacity accessibilityRole="button" onPress={importDocuments} style={[styles.toolButton, { backgroundColor: theme.card, borderColor: theme.border }]}>
                 <Text style={{ color: theme.text }}>Import</Text>
               </TouchableOpacity>
+                </>
+              ) : (
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  disabled={isDiscoveringFiles}
+                  onPress={() => void refreshDiscoveredFiles({ manual: true })}
+                  style={[styles.toolButton, { backgroundColor: theme.card, borderColor: theme.border, opacity: isDiscoveringFiles ? 0.55 : 1 }]}
+                >
+                  <Text style={{ color: theme.text }}>{isDiscoveringFiles ? 'Refreshing…' : 'Refresh'}</Text>
+                </TouchableOpacity>
+              )}
               <TouchableOpacity
                 accessibilityRole="button"
                 accessibilityLabel={`Sort by ${sortMode}. Tap to change sort.`}
@@ -2556,7 +3282,7 @@ export default function App() {
                   style={[styles.outlineButton, { borderColor: theme.border, marginBottom: 12 }]}
                   onPress={() => {
                     setSearch('');
-                    setActiveStorage('app');
+                    setActiveStorage('discovery');
                     setCurrentPath(APP_STORAGE);
                     setCategoryFilter(collectionCategory);
                     setSelectedCollection(null);
@@ -2567,7 +3293,7 @@ export default function App() {
                   <Text style={{ color: theme.text }}>Browse all {CATEGORY_CONFIG.find((item) => item.key === collectionCategory)?.label}</Text>
                 </TouchableOpacity>
                 {visibleCollections.map((name) => {
-                  const count = allLocalFiles.filter(
+                  const count = accessibleFiles.filter(
                     (file) =>
                       fileCategoryKey(file) === collectionCategory &&
                       collectionMetadata.assignments[file.uri]?.[collectionCategory]?.includes(name)
@@ -2580,7 +3306,7 @@ export default function App() {
                       style={[styles.recentItem, { borderBottomColor: theme.border }]}
                       onPress={() => {
                         setSearch('');
-                        setActiveStorage('app');
+                        setActiveStorage('discovery');
                         setCurrentPath(APP_STORAGE);
                         setCategoryFilter(collectionCategory);
                         setSelectedCollection(name);
@@ -2611,10 +3337,10 @@ export default function App() {
             ) : (
               <>
                 <Text style={[styles.bodyCopy, { color: theme.muted }]}>
-                  Browse supported file types across Best’s private files and organize images, videos, and documents into collections.
+                  Browse accessible files from shared phone media, your authorized folder, and Best storage. Files are categorized without copying their contents.
                 </Text>
                 <Text style={[styles.itemMeta, { color: theme.muted, marginBottom: 12 }]}>
-                  Downloads identifies temporary download-file extensions only; Best cannot infer a file’s original device Downloads folder.
+                  Shared photos, videos, and audio appear when Android access is granted. Documents and downloads are discovered inside a folder you authorize.
                 </Text>
                 <View style={styles.categoryGrid}>
                   {visibleCategories.map((category) => {
@@ -2652,20 +3378,49 @@ export default function App() {
         {activeTab === 'recent' && (
           <ScrollView contentContainerStyle={styles.contentPad}>
             <View style={[styles.sectionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
-              <Text style={[styles.cardTitle, { color: theme.text }]}>Recently modified files</Text>
-              <Text style={[styles.bodyCopy, { color: theme.muted }]}>Recent Best-managed files from all app folders, ordered by their available modification time.</Text>
-              {visibleRecentFiles.length ? (
-                visibleRecentFiles.map((file) => (
-                  <TouchableOpacity key={file.id} accessibilityRole="button" onPress={() => canPreviewImage(file) ? previewImage(file) : handleOpenFile(file)} style={[styles.recentItem, { borderBottomColor: theme.border }]}>
-                    <Text style={[styles.recentMark, { color: theme.accent, backgroundColor: theme.accentSoft }]}>{fileIconForItem(file)}</Text>
-                    <View style={styles.listInfo}>
-                      <Text style={[styles.itemName, { color: theme.text }]}>{file.name}</Text>
-                      <Text style={[styles.itemMeta, { color: theme.muted }]}>{formatDate(file.modifiedAt)} · {formatBytes(file.size)}</Text>
-                    </View>
+              <Text style={[styles.cardTitle, { color: theme.text }]}>Recent files</Text>
+              <Text style={[styles.bodyCopy, { color: theme.muted }]}>Files you opened, previewed, imported, or downloaded, ordered by recent activity.</Text>
+              {recentActivityLoading ? (
+                <Text style={[styles.emptyLabel, { color: theme.muted }]}>Loading recent files...</Text>
+              ) : recentActivityError ? (
+                <View>
+                  <Text style={{ color: theme.danger }}>{recentActivityError}</Text>
+                  <TouchableOpacity accessibilityRole="button" onPress={() => void loadRecentActivityIndex()} style={styles.outlineButton}>
+                    <Text style={{ color: theme.accent }}>Retry</Text>
                   </TouchableOpacity>
+                </View>
+              ) : visibleRecentFiles.length ? (
+                visibleRecentFiles.map((file) => (
+                  <View key={file.uri || file.id} style={[styles.recentItem, { borderBottomColor: theme.border }]}>
+                    <TouchableOpacity
+                      accessibilityRole="button"
+                      disabled={file.accessible === false}
+                      onPress={() => canPreviewImage(file) ? previewImage(file) : handleOpenFile(file)}
+                      style={styles.listInfo}
+                    >
+                      <View style={styles.fileRowInline}>
+                        <Text style={[styles.recentMark, { color: theme.accent, backgroundColor: theme.accentSoft }]}>{fileIconForItem(file)}</Text>
+                        <View style={styles.listInfo}>
+                          <Text style={[styles.itemName, { color: theme.text }]}>{file.name}</Text>
+                          <Text style={[styles.itemMeta, { color: file.accessible === false ? theme.danger : theme.muted }]}>
+                            {file.accessible === false
+                              ? 'Unavailable - original location is inaccessible'
+                              : `${formatDate(file.activityAt)} · ${formatBytes(file.size)}`}
+                          </Text>
+                        </View>
+                      </View>
+                    </TouchableOpacity>
+                    <TouchableOpacity accessibilityRole="button" accessibilityLabel={`Remove ${file.name} from recent files`} onPress={() => void removeRecentItem(file.uri)}>
+                      <Text style={{ color: theme.muted }}>Remove</Text>
+                    </TouchableOpacity>
+                  </View>
                 ))
               ) : (
-                <Text style={[styles.emptyLabel, { color: theme.muted }]}>No recent files match this search.</Text>
+                <Text style={[styles.emptyLabel, { color: theme.muted }]}>
+                  {search.trim()
+                    ? 'No recent files match this search.'
+                    : 'No recent files yet. Files you open or import will appear here.'}
+                </Text>
               )}
             </View>
           </ScrollView>
@@ -2684,6 +3439,194 @@ export default function App() {
                   <Text style={{ color: theme.text }}>Use {darkMode ? 'light' : 'dark'}</Text>
                 </TouchableOpacity>
               </View>
+            </View>
+            <View style={[styles.sectionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
+              <Text style={[styles.cardTitle, { color: theme.text }]}>File discovery & storage</Text>
+              <Text style={[styles.bodyCopy, { color: theme.muted }]}>
+                Discovery is read-only by default: Best lists accessible files in their original locations and does not copy them just to categorize or display them.
+              </Text>
+              {discoverySettingsError ? (
+                <Text accessibilityRole="alert" style={[styles.errorText, { color: theme.danger }]}>
+                  {discoverySettingsError}
+                </Text>
+              ) : null}
+              <View style={[styles.settingRow, styles.securitySettingRow]}>
+                <View style={styles.listInfo}>
+                  <Text style={[styles.itemName, { color: theme.text }]}>Automatic file discovery</Text>
+                  <Text style={[styles.itemMeta, { color: theme.muted }]}>Discover shared media and files inside the folder you authorize.</Text>
+                </View>
+                <TouchableOpacity
+                  accessibilityRole="switch"
+                  accessibilityLabel="Automatic file discovery"
+                  accessibilityState={{ checked: discoverySettings.autoDiscoveryEnabled }}
+                  onPress={() => void updateDiscoverySettings({ autoDiscoveryEnabled: !discoverySettings.autoDiscoveryEnabled })}
+                  style={[styles.outlineButton, { borderColor: theme.border }]}
+                >
+                  <Text style={{ color: theme.text }}>{discoverySettings.autoDiscoveryEnabled ? 'On' : 'Off'}</Text>
+                </TouchableOpacity>
+              </View>
+              <View style={[styles.settingRow, styles.securitySettingRow]}>
+                <View style={styles.listInfo}>
+                  <Text style={[styles.itemName, { color: theme.text }]}>Automatic refresh</Text>
+                  <Text style={[styles.itemMeta, { color: theme.muted }]}>Refresh on app launch, when returning to Best, and on supported media-change events while Best is running.</Text>
+                </View>
+                <TouchableOpacity
+                  accessibilityRole="switch"
+                  accessibilityLabel="Automatic refresh"
+                  accessibilityState={{ checked: discoverySettings.autoRefreshEnabled }}
+                  onPress={() => void updateDiscoverySettings({ autoRefreshEnabled: !discoverySettings.autoRefreshEnabled }, false)}
+                  style={[styles.outlineButton, { borderColor: theme.border }]}
+                >
+                  <Text style={{ color: theme.text }}>{discoverySettings.autoRefreshEnabled ? 'On' : 'Off'}</Text>
+                </TouchableOpacity>
+              </View>
+              {Platform.OS === 'android' ? (
+                <View style={[styles.settingRow, styles.securitySettingRow]}>
+                  <View style={styles.listInfo}>
+                    <Text style={[styles.itemName, { color: theme.text }]}>Shared media access</Text>
+                    <Text style={[styles.itemMeta, { color: theme.muted }]}>
+                      {mediaPermission?.granted
+                        ? `Granted${mediaPermission.accessPrivileges === 'limited' ? ' · limited selection' : ''}. Shared images, videos, and audio stay in place.`
+                        : 'Android permission is required to discover shared images, videos, and audio. Best does not scan other apps’ private data.'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    accessibilityRole="button"
+                    disabled={isDiscoveringFiles}
+                    onPress={() => mediaPermission?.accessPrivileges === 'limited'
+                      ? void manageLimitedMediaAccess()
+                      : void requestMediaAccess()}
+                    style={[styles.outlineButton, { borderColor: theme.border, opacity: isDiscoveringFiles ? 0.55 : 1 }]}
+                  >
+                    <Text style={{ color: theme.text }}>
+                      {mediaPermission?.accessPrivileges === 'limited'
+                        ? 'Manage access'
+                        : mediaPermission?.granted
+                          ? 'Check access'
+                          : 'Allow access'}
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <Text style={[styles.itemMeta, { color: theme.muted }]}>Shared-media discovery is available in the Android app build.</Text>
+              )}
+              {mediaDiscoveryError ? (
+                <Text accessibilityRole="alert" style={[styles.itemMeta, { color: theme.danger }]}>{mediaDiscoveryError}</Text>
+              ) : null}
+              {authorizedDiscoveryError ? (
+                <Text accessibilityRole="alert" style={[styles.itemMeta, { color: theme.danger }]}>{authorizedDiscoveryError}</Text>
+              ) : null}
+              <View style={styles.quickActions}>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  disabled={isDiscoveringFiles}
+                  onPress={() => void refreshDiscoveredFiles({ manual: true })}
+                  style={[styles.quickButton, { backgroundColor: theme.accentSoft, opacity: isDiscoveringFiles ? 0.55 : 1 }]}
+                >
+                  <Text style={{ color: theme.accent }}>{isDiscoveringFiles ? 'Refreshing…' : 'Refresh files now'}</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  accessibilityRole="button"
+                  onPress={() => void selectAuthorizedFolder()}
+                  style={[styles.quickButton, { backgroundColor: theme.cardAlt }]}
+                >
+                  <Text style={{ color: theme.text }}>{authorizedFolder ? `Folder: ${authorizedFolder.name}` : 'Choose authorized folder'}</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={[styles.itemMeta, { color: theme.muted, marginTop: 8 }]}>
+                Android does not provide Best with continuous access to every folder. The selected folder is scanned when Best refreshes; background monitoring while Best is closed is not enabled.
+              </Text>
+              <View style={[styles.settingRow, styles.securitySettingRow]}>
+                <View style={styles.listInfo}>
+                  <Text style={[styles.itemName, { color: theme.text }]}>Automatically copy selected file types into Best storage</Text>
+                  <Text style={[styles.itemMeta, { color: theme.muted }]}>
+                    Off by default. Copies use extra phone storage and can create duplicates. Only accessible files from shared media or your authorized folder are eligible.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  accessibilityRole="switch"
+                  accessibilityLabel="Automatically copy selected file types into Best storage"
+                  accessibilityState={{ checked: discoverySettings.autoCopyEnabled }}
+                  onPress={() => {
+                    if (discoverySettings.autoCopyEnabled) {
+                      void updateDiscoverySettings({ autoCopyEnabled: false }, false);
+                      return;
+                    }
+                    Alert.alert(
+                      'Automatic copies use extra storage',
+                      'Best will create additional copies in Best storage for the selected file types. This uses phone storage and can create duplicates. Only files Best can access will be copied. Continue?',
+                      [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Enable copies', onPress: () => void updateDiscoverySettings({ autoCopyEnabled: true }) },
+                      ]
+                    );
+                  }}
+                  style={[styles.outlineButton, { borderColor: theme.border }]}
+                >
+                  <Text style={{ color: theme.text }}>{discoverySettings.autoCopyEnabled ? 'On' : 'Off'}</Text>
+                </TouchableOpacity>
+              </View>
+              <Text style={[styles.itemMeta, { color: theme.muted }]}>
+                Copy destination: Best storage / Automatic copies
+              </Text>
+              {[
+                ['images', 'Images'],
+                ['videos', 'Videos'],
+                ['audio', 'Audio'],
+                ['documents', 'Documents'],
+                ['downloads', 'Files in the authorized Downloads folder'],
+              ].map(([type, label]) => {
+                const selected = discoverySettings.autoCopyTypes.includes(type);
+                return (
+                  <View key={type} style={[styles.settingRow, styles.securitySettingRow]}>
+                    <Text style={[styles.itemName, { color: theme.text }]}>{label}</Text>
+                    <TouchableOpacity
+                      accessibilityRole="checkbox"
+                      accessibilityLabel={`Automatically copy ${label.toLowerCase()}`}
+                      accessibilityState={{ checked: selected, disabled: !discoverySettings.autoCopyEnabled }}
+                      disabled={!discoverySettings.autoCopyEnabled}
+                      onPress={() => {
+                        const nextTypes = selected
+                          ? discoverySettings.autoCopyTypes.filter((value) => value !== type)
+                          : [...discoverySettings.autoCopyTypes, type];
+                        void updateDiscoverySettings({ autoCopyTypes: nextTypes });
+                      }}
+                      style={[styles.outlineButton, { borderColor: theme.border, opacity: discoverySettings.autoCopyEnabled ? 1 : 0.5 }]}
+                    >
+                      <Text style={{ color: theme.text }}>{selected ? 'Selected' : 'Not selected'}</Text>
+                    </TouchableOpacity>
+                  </View>
+                );
+              })}
+              <Text style={[styles.bodyCopy, { color: theme.muted }]}>
+                Best storage copies · {formatBytes(automaticCopyUsage)} across {automaticCopyFiles.length} files
+              </Text>
+              {automaticCopyNotice ? (
+                <Text style={[styles.itemMeta, { color: theme.muted }]}>{automaticCopyNotice}</Text>
+              ) : null}
+              {Object.values(automaticCopyHistory).filter((record) => record.status === 'complete').length ? (
+                <Text style={[styles.itemMeta, { color: theme.muted }]}>
+                  Automatic-copy history: {Object.values(automaticCopyHistory).filter((record) => record.status === 'complete').length} source file(s) recorded to prevent repeated copies.
+                </Text>
+              ) : null}
+              <TouchableOpacity
+                accessibilityRole="button"
+                onPress={async () => {
+                  try {
+                    await ensureDirectory(AUTOMATIC_COPY_ROOT);
+                    setActiveStorage('app');
+                    setCategoryFilter(null);
+                    setSelectedCollection(null);
+                    setCurrentPath(AUTOMATIC_COPY_ROOT);
+                    setActiveTab('browse');
+                  } catch (error) {
+                    Alert.alert('Copied files unavailable', error?.message || 'Best could not open the automatic-copy folder.');
+                  }
+                }}
+                style={[styles.outlineButton, { borderColor: theme.border, alignSelf: 'flex-start', marginTop: 8 }]}
+              >
+                <Text style={{ color: theme.text }}>View automatic copies</Text>
+              </TouchableOpacity>
             </View>
             <View style={[styles.sectionCard, { backgroundColor: theme.card, borderColor: theme.border }]}>
               <Text style={[styles.cardTitle, { color: theme.text }]}>App lock</Text>
@@ -3329,6 +4272,11 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingVertical: 13,
     borderBottomWidth: StyleSheet.hairlineWidth,
+  },
+  fileRowInline: {
+    minWidth: 0,
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   recentMark: {
     minWidth: 44,

@@ -127,11 +127,52 @@ export async function createLocalFolder(fs, directoryUri, requestedName) {
   return destination;
 }
 
-export async function importLocalFile(fs, sourceUri, directoryUri, requestedName) {
+export async function importLocalFile(fs, sourceUri, directoryUri, requestedName, expectedSize = 0) {
+  if (
+    typeof sourceUri !== 'string' ||
+    !(sourceUri.startsWith('file://') || sourceUri.startsWith('content://'))
+  ) {
+    throw new Error('The source file reference is invalid or unsupported.');
+  }
   const name = requireValidItemName(requestedName);
   const destination = childUri(directoryUri, name);
   await requireUnusedDestination(fs, destination, name);
-  await fs.copyAsync({ from: sourceUri, to: destination });
+  const temporaryName = `.${Date.now()}-${name}.pending`;
+  const temporaryDestination = childUri(directoryUri, temporaryName);
+  let destinationCreated = false;
+  try {
+    await requireUnusedDestination(fs, temporaryDestination, temporaryName);
+    await fs.copyAsync({ from: sourceUri, to: temporaryDestination });
+    const temporaryInfo = await fs.getInfoAsync(temporaryDestination);
+    if (!temporaryInfo.exists || temporaryInfo.isDirectory) {
+      throw new Error('The copied file could not be verified.');
+    }
+    if (Number.isFinite(expectedSize) && expectedSize > 0 && temporaryInfo.size !== expectedSize) {
+      throw new Error('The copied file size does not match the source file.');
+    }
+    await fs.moveAsync({ from: temporaryDestination, to: destination });
+    destinationCreated = true;
+    const savedInfo = await fs.getInfoAsync(destination);
+    if (!savedInfo.exists || savedInfo.isDirectory) {
+      throw new Error('The saved file could not be verified in its destination.');
+    }
+  } catch (error) {
+    const cleanupErrors = [];
+    for (const uri of [temporaryDestination, ...(destinationCreated ? [destination] : [])]) {
+      try {
+        const info = await fs.getInfoAsync(uri);
+        if (info.exists) await fs.deleteAsync(uri);
+      } catch (cleanupError) {
+        cleanupErrors.push(cleanupError?.message || 'cleanup failed');
+      }
+    }
+    if (cleanupErrors.length) {
+      throw new Error(
+        `${error?.message || 'The file could not be copied.'} Incomplete-file cleanup failed: ${cleanupErrors.join('; ')}`
+      );
+    }
+    throw error;
+  }
   return destination;
 }
 

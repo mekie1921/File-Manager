@@ -58,6 +58,14 @@ function requireBytes(value) {
   throw new Error('The local file could not be read as binary data.');
 }
 
+async function readBrowserFile(file) {
+  const contents = await file.arrayBuffer();
+  if (!(contents instanceof ArrayBuffer)) {
+    throw new Error('The selected browser file could not be read as binary data.');
+  }
+  return new Uint8Array(contents);
+}
+
 function requireFileSize(value, label) {
   const size = typeof value === 'string' && value.trim() ? Number(value) : value;
   if (!Number.isSafeInteger(size) || size < 0) {
@@ -136,7 +144,14 @@ export function createCloudFileService({
 
   async function upload(item) {
     const ownerId = await currentOwnerId();
-    if (typeof item?.uri !== 'string' || !item.uri.startsWith('file://')) {
+    const browserFile =
+      item?.file &&
+      typeof item.file.arrayBuffer === 'function' &&
+      Number.isSafeInteger(item.file.size) &&
+      item.file.size >= 0
+        ? item.file
+        : null;
+    if (!browserFile && (typeof item?.uri !== 'string' || !item.uri.startsWith('file://'))) {
       throw new Error('Cloud upload requires a local file URI. Authorized content URIs are not supported.');
     }
     const filename = requireFileName(item.name);
@@ -147,14 +162,19 @@ export function createCloudFileService({
       typeof item.mimeType === 'string' && item.mimeType.trim()
         ? item.mimeType.trim()
         : 'application/octet-stream';
-    const localSize = requireFileSize(await getLocalFileSize(item.uri), 'The local file size');
+    const localSize = requireFileSize(
+      browserFile ? browserFile.size : await getLocalFileSize(item.uri),
+      'The local file size'
+    );
     if (item.size !== undefined && item.size !== null && Number(item.size) !== localSize) {
       throw new Error('The selected file changed before upload. Select it again and retry.');
     }
     if (localSize > MAX_CLOUD_FILE_SIZE_BYTES) {
       throw new Error(`Cloud files cannot be larger than ${MAX_CLOUD_FILE_SIZE_BYTES / (1024 * 1024)} MB.`);
     }
-    const bytes = requireBytes(await readLocalFile(item.uri));
+    const bytes = browserFile
+      ? await readBrowserFile(browserFile)
+      : requireBytes(await readLocalFile(item.uri));
     if (bytes.byteLength !== localSize) {
       throw new Error('The local file changed while it was being read. Select it again and retry.');
     }
@@ -254,7 +274,10 @@ export function createCloudFileService({
       throw new Error('The downloaded file size does not match its cloud metadata. The file was not saved.');
     }
     const localUri = await writeLocalFile(requireFileName(activeRecord.filename), bytes);
-    if (typeof localUri !== 'string' || !localUri.startsWith('file://')) {
+    if (
+      typeof localUri !== 'string' ||
+      (!localUri.startsWith('file://') && !localUri.startsWith('blob:'))
+    ) {
       throw new Error('The downloaded file was not saved to local app storage.');
     }
     return { record: activeRecord, localUri, size: bytes.byteLength };
